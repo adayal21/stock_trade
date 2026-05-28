@@ -1,0 +1,22 @@
+# =============================================================================
+# India Bot — Requirements
+# =============================================================================
+# Install with:
+#   pip install -r requirements.txt
+# =============================================================================
+
+# Zerodha Kite Connect official Python client
+kiteconnect>=5.0.0
+
+# Environment variable management
+python-dotenv>=1.0.0
+
+# Data processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Technical indicators (Supertrend, RSI, EMA)
+pandas_ta>=0.3.14b
+
+# HTTP requests (Telegram notifications)
+requests>=2.31.0
