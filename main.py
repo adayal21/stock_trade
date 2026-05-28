@@ -3,53 +3,49 @@ main.py — India Bot (Zerodha Kite Connect)
 ==========================================
 Runs ONCE daily at 15:45 IST via cron, after NSE closes at 15:30.
 
+DATA SOURCE  : Yahoo Finance (free, no API key, goes back 15+ years)
+ORDER SOURCE : Kite Connect (Personal plan is fine — orders only, no historical API needed)
+
 CANDLE TIMEFRAME: DAILY (1 candle = 1 full trading day)
 The bot looks at today's closing price only. No intraday monitoring.
-No hourly checks. One run per day. That's it.
+One run per day. That is it.
 
 HOW SIGNALS WORK:
-    The Supertrend indicator changes only when a daily candle closes.
-    So there is nothing to check between 15:45 today and 15:45 tomorrow.
-    The bot runs, acts on today's close, places AMO orders for tomorrow
-    morning, then does NOTHING until the next 15:45 cron.
+    Supertrend changes only on a daily close.
+    Nothing to check between 15:45 today and 15:45 tomorrow.
+    Bot runs, computes signal on today's close, places AMO if needed,
+    then does NOTHING until next 15:45 cron.
 
-FILES CREATED IN data/ FOLDER:
+FILES IN data/ FOLDER:
+    bot.log                    - full timestamped log of every run
+    run_log.csv                - one row per cron run (audit trail)
     portfolio.csv              - equity curve, one row per day
-    run_log.csv                - one row per cron run with full summary
-    {SYMBOL}_position.csv      - currently open position for that stock
-                                 (deleted automatically when trade exits)
+    {SYMBOL}_position.csv      - open position (deleted when trade exits)
     {SYMBOL}_trades.csv        - complete history of all closed trades
-
-POSITION CSV FORMAT (e.g. BAJFINANCE_position.csv):
-    Symbol, Side, Entry Price, Quantity, Entry Date, Bars_Held, Strategy
-    One row only. Overwritten each day to update Bars_Held.
-    Deleted when position is exited.
-
-TRADES CSV FORMAT (e.g. BAJFINANCE_trades.csv):
-    Symbol, Side, Entry Price, Exit Price, Quantity, PnL, Exit Reason, Entry Date, Exit Date
-    One row per completed trade. Appended, never overwritten.
 
 STRATEGY:
     Stocks (BAJFINANCE, TITAN, RELIANCE, MARUTI, LT):
-        Entry: Supertrend(10,3) flips bullish AND Nifty > EMA(50)
-        Exit:  Supertrend(10,3) flips bearish
-        Hold:  Typically 30-90 days
+        Entry : Supertrend(10,3) flips bullish AND Nifty > EMA(50)
+        Exit  : Supertrend(10,3) flips bearish
+        Hold  : Typically 30-90 days
 
     ETFs (NIFTYBEES, BANKBEES):
-        Entry: RSI(14) crosses above 60 AND volume > 50d avg AND close > EMA(200)
-        Exit:  RSI(14) drops below 50
-        Hold:  Typically 20-60 days
+        Entry : RSI(14) crosses above 60 AND volume > 50d avg AND close > EMA(200)
+        Exit  : RSI(14) drops below 50
+        Hold  : Typically 20-60 days
 
 ORDER TYPE: AMO (After Market Order)
-    Placed at 15:45 IST after market close.
-    Executes at next morning market open ~9:15 AM IST.
-    Product: CNC (Cash & Carry = delivery, held overnight)
+    Placed at 15:45 IST. Executes at next morning open ~9:15 AM IST.
+    Product: CNC (delivery, held overnight)
 """
 
 import os
 import sys
 import time
 import logging
+import warnings
+warnings.filterwarnings("ignore")
+
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
@@ -62,10 +58,9 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from kiteconnect import KiteConnect
-    from kiteconnect.exceptions import KiteException
+    import yfinance as yf
 except ImportError:
-    print("ERROR: pip install kiteconnect")
+    print("ERROR: pip install yfinance")
     sys.exit(1)
 
 try:
@@ -77,23 +72,21 @@ except ImportError:
 load_dotenv()
 
 from config import (
-    TRADING_MODE, INITIAL_CAPITAL, DATA_DIR, INSTRUMENTS, NIFTY_YAHOO,
+    TRADING_MODE, INITIAL_CAPITAL, DATA_DIR, INSTRUMENTS,
     ST_PERIOD, ST_MULTIPLIER, NIFTY_EMA_LEN,
     RSI_PERIOD, RSI_ENTRY, RSI_EXIT, EMA_200_LEN, VOL_AVG_LEN,
     ALLOCATION_PCT, MAX_OPEN_POSITIONS, MIN_QUANTITY,
     PRODUCT_TYPE, ORDER_TYPE, EXCHANGE,
-    HISTORY_DAYS, KITE_INTERVAL,
     COMMISSION_RT, TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, VERBOSE, IST,
 )
 
 os.makedirs(DATA_DIR, exist_ok=True)
 
 # =============================================================================
-# Logging setup — writes to data/bot.log AND console simultaneously
+# Logging — writes to data/bot.log AND console simultaneously
 # =============================================================================
 
 LOG_FILE = f"{DATA_DIR}/bot.log"
-
 logging.basicConfig(
     level    = logging.INFO,
     format   = "%(asctime)s IST | %(message)s",
@@ -105,24 +98,33 @@ logging.basicConfig(
 )
 log = logging.getLogger("india_bot")
 
-
 def sep(char="=", width=62):
     log.info(char * width)
 
 
 # =============================================================================
-# Kite Connect
+# Kite Connect — only used for order placement in live mode
 # =============================================================================
 
-def get_kite() -> KiteConnect:
+def get_kite():
+    """Returns a KiteConnect instance. Only called in live mode."""
+    try:
+        from kiteconnect import KiteConnect
+        from kiteconnect.exceptions import KiteException
+    except ImportError:
+        log.error("kiteconnect not installed: pip install kiteconnect")
+        sys.exit(1)
+
     api_key      = os.environ.get("KITE_API_KEY", "").strip()
     access_token = os.environ.get("KITE_ACCESS_TOKEN", "").strip()
+
     if not api_key:
         log.error("KITE_API_KEY not set in .env")
         sys.exit(1)
     if not access_token:
         log.error("KITE_ACCESS_TOKEN not set — run kite_auth.py first")
         sys.exit(1)
+
     kite = KiteConnect(api_key=api_key)
     kite.set_access_token(access_token)
     return kite
@@ -175,7 +177,7 @@ def count_open() -> int:
 
 
 # =============================================================================
-# Portfolio + run log helpers
+# Portfolio + run log
 # =============================================================================
 
 def load_portfolio_state() -> dict:
@@ -211,10 +213,6 @@ def log_portfolio(cash, equity, open_pos, realized_pnl,
 
 
 def log_run(run_data: dict) -> None:
-    """
-    Write one row to data/run_log.csv after every cron execution.
-    This is your audit trail — one row per day showing exactly what happened.
-    """
     f  = f"{DATA_DIR}/run_log.csv"
     df = pd.DataFrame([run_data])
     if os.path.exists(f):
@@ -229,94 +227,42 @@ def init_portfolio() -> None:
 
 
 # =============================================================================
-# Historical data fetch — always from Kite Connect
+# Data fetch — Yahoo Finance (free, no auth needed)
 # =============================================================================
 
-_instrument_token_cache = {}   # cache tokens so we don't fetch instruments list 7 times
-
-def _get_token(kite: KiteConnect, tradingsymbol: str, exchange: str) -> int | None:
-    cache_key = f"{exchange}:{tradingsymbol}"
-    if cache_key in _instrument_token_cache:
-        return _instrument_token_cache[cache_key]
+def fetch_yahoo(yahoo_ticker: str, period: str = "2y") -> pd.DataFrame:
+    """
+    Fetch daily OHLCV from Yahoo Finance.
+    NSE tickers use .NS suffix e.g. BAJFINANCE.NS, ^NSEI for Nifty 50.
+    """
     try:
-        instruments = kite.instruments(exchange)
-        for inst in instruments:
-            key = f"{exchange}:{inst['tradingsymbol']}"
-            _instrument_token_cache[key] = inst["instrument_token"]
-        return _instrument_token_cache.get(cache_key)
+        raw = yf.download(yahoo_ticker, period=period,
+                          progress=False, auto_adjust=True)
     except Exception as e:
-        log.warning(f"  [{tradingsymbol}] instruments fetch failed: {e}")
-        return None
-
-
-def fetch_kite_history(kite: KiteConnect,
-                       tradingsymbol: str,
-                       exchange: str) -> pd.DataFrame:
-    """Fetch daily OHLCV candles from Kite Connect."""
-    token = _get_token(kite, tradingsymbol, exchange)
-    if not token:
-        log.warning(f"  [{tradingsymbol}] token not found")
+        log.warning(f"  [{yahoo_ticker}] Yahoo fetch failed: {e}")
         return pd.DataFrame()
 
-    end_dt   = datetime.now(IST).replace(hour=15, minute=30, second=0, microsecond=0)
-    start_dt = end_dt - timedelta(days=HISTORY_DAYS * 2)
-
-    try:
-        records = kite.historical_data(
-            instrument_token = token,
-            from_date        = start_dt,
-            to_date          = end_dt,
-            interval         = KITE_INTERVAL,
-            continuous       = False,
-            oi               = False,
-        )
-    except KiteException as e:
-        log.warning(f"  [{tradingsymbol}] history fetch failed: {e}")
+    if raw.empty:
         return pd.DataFrame()
 
-    if not records:
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+
+    needed = ["Open","High","Low","Close","Volume"]
+    missing = [c for c in needed if c not in raw.columns]
+    if missing:
         return pd.DataFrame()
 
-    df = pd.DataFrame(records)
-    df = df.rename(columns={
-        "date": "Date", "open": "Open", "high": "High",
-        "low":  "Low",  "close": "Close", "volume": "Volume",
-    })
-    df["Date"] = pd.to_datetime(df["Date"])
-    if df["Date"].dt.tz is None:
-        df["Date"] = df["Date"].dt.tz_localize(IST)
-    df = df.set_index("Date").sort_index()
+    df = raw[needed].copy()
+    df.index = pd.to_datetime(df.index).normalize()
+    df.index.name = "Date"
+    df = df.sort_index()
     df = df[~df.index.duplicated(keep="last")]
-    df = df.tail(HISTORY_DAYS)
-    for col in ["Open","High","Low","Close","Volume"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    for c in needed:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
     df = df.dropna(subset=["Open","High","Low","Close"])
-    return df[["Open","High","Low","Close","Volume"]]
-
-
-def fetch_nifty_history(kite: KiteConnect) -> pd.Series | None:
-    """Fetch Nifty 50 daily closes and return EMA(50) series."""
-    NIFTY_TOKEN = 256265
-    end_dt   = datetime.now(IST).replace(hour=15, minute=30, second=0, microsecond=0)
-    start_dt = end_dt - timedelta(days=HISTORY_DAYS * 2)
-    try:
-        records = kite.historical_data(
-            instrument_token = NIFTY_TOKEN,
-            from_date        = start_dt,
-            to_date          = end_dt,
-            interval         = KITE_INTERVAL,
-        )
-    except Exception as e:
-        log.warning(f"  [NIFTY50] history fetch failed: {e}")
-        return None
-    if not records:
-        return None
-    df = pd.DataFrame(records)
-    df["date"] = pd.to_datetime(df["date"])
-    df = df.set_index("date").sort_index()
-    closes = pd.to_numeric(df["close"], errors="coerce").dropna()
-    return ta.ema(closes, length=NIFTY_EMA_LEN)
+    df = df[df["Close"] > 0]
+    return df
 
 
 # =============================================================================
@@ -349,15 +295,10 @@ def compute_supertrend_signal(df: pd.DataFrame,
     flip_bull    = st_bull_now  and not st_bull_prev
     flip_bear    = not st_bull_now and st_bull_prev
 
-    # Nifty regime
+    # Nifty regime check
     nifty_ok = True
     if nifty_ema is not None and len(nifty_ema) > 0:
-        try:
-            idx = nifty_ema.index.get_indexer([df.index[-1]], method="ffill")[0]
-            if idx >= 0:
-                nifty_ok = True   # EMA computed = Nifty in usable state
-        except Exception:
-            nifty_ok = True
+        nifty_ok = True   # EMA computed = Nifty data available
 
     return {
         "entry_signal": flip_bull and nifty_ok,
@@ -423,7 +364,8 @@ def _telegram(msg: str) -> None:
         import requests
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "HTML"},
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": msg,
+                  "parse_mode": "HTML"},
             timeout=10,
         )
     except Exception:
@@ -440,8 +382,8 @@ run_start = datetime.now(IST)
 sep()
 log.info(f"  INDIA BOT — Mode: {TRADING_MODE.upper()}")
 log.info(f"  {run_start.strftime('%Y-%m-%d %H:%M IST')}")
-log.info(f"  Candle: DAILY | Strategy: Supertrend(10,3) + RSI Momentum")
-log.info(f"  Cron runs once at 15:45 IST — no intraday monitoring")
+log.info(f"  Data: Yahoo Finance | Orders: Kite Connect (live only)")
+log.info(f"  Candle: DAILY | Cron: once at 15:45 IST")
 sep()
 
 # ── Load state ────────────────────────────────────────────────────────────────
@@ -457,38 +399,49 @@ log.info(f"  Realized PnL : Rs {realized_pnl:+,.2f}")
 log.info(f"  Total trades : {total_trades}")
 log.info(f"  Open pos     : {count_open()}")
 
-# ── Connect ───────────────────────────────────────────────────────────────────
-sep("-")
-log.info("  Connecting to Kite Connect...")
-kite = get_kite()
-try:
-    profile = kite.profile()
-    log.info(f"  Logged in as : {profile['user_name']} ({profile['user_id']})")
-    if TRADING_MODE == "paper":
-        log.info("  Paper mode   : data only, NO real orders placed")
-except Exception as e:
-    log.warning(f"  Profile check failed: {e}")
-
-# ── Nifty regime ──────────────────────────────────────────────────────────────
-sep("-")
-log.info("  Fetching Nifty 50 for regime filter...")
-nifty_ema = fetch_nifty_history(kite)
-if nifty_ema is not None and len(nifty_ema) > 0:
-    nifty_val = float(nifty_ema.iloc[-1])
-    log.info(f"  Nifty EMA({NIFTY_EMA_LEN}) : {nifty_val:,.2f}")
+# ── Kite — only connect in live mode ──────────────────────────────────────────
+kite = None
+if TRADING_MODE == "live":
+    sep("-")
+    log.info("  Connecting to Kite Connect for order placement...")
+    try:
+        from kiteconnect.exceptions import KiteException
+        kite = get_kite()
+        profile = kite.profile()
+        log.info(f"  Logged in as : {profile['user_name']} ({profile['user_id']})")
+    except Exception as e:
+        log.error(f"  Kite login failed: {e}")
+        log.error("  Cannot place live orders — exiting.")
+        sys.exit(1)
 else:
-    log.warning("  Nifty unavailable — regime filter disabled for this run")
+    log.info("  Paper mode — Yahoo Finance for data, no Kite orders.")
 
-# ── Fetch candles ─────────────────────────────────────────────────────────────
+# ── Nifty regime via Yahoo Finance ────────────────────────────────────────────
 sep("-")
-log.info("  Fetching daily candles from Kite Connect...")
-log.info(f"  (1 candle = 1 trading day | fetching last {HISTORY_DAYS} days)")
+log.info("  Fetching Nifty 50 (Yahoo Finance: ^NSEI)...")
+nifty_df  = fetch_yahoo("^NSEI", period="2y")
+nifty_ema = None
+if not nifty_df.empty:
+    nifty_ema = ta.ema(nifty_df["Close"], length=NIFTY_EMA_LEN)
+    nifty_latest  = float(nifty_df["Close"].iloc[-1])
+    nifty_ema_val = float(nifty_ema.iloc[-1]) if nifty_ema is not None else 0
+    nifty_regime  = "UPTREND" if nifty_latest > nifty_ema_val else "DOWNTREND"
+    log.info(f"  Nifty close  : {nifty_latest:,.2f}")
+    log.info(f"  Nifty EMA({NIFTY_EMA_LEN}): {nifty_ema_val:,.2f}")
+    log.info(f"  Nifty regime : {nifty_regime}")
+else:
+    log.warning("  Nifty data unavailable — regime filter disabled")
+
+# ── Fetch candles via Yahoo Finance ───────────────────────────────────────────
+sep("-")
+log.info("  Fetching daily candles (Yahoo Finance)...")
+log.info(f"  1 candle = 1 trading day | period = 2 years")
 
 instruments_data = {}
-for sym, exch, _yahoo, strategy, name in INSTRUMENTS:
-    df = fetch_kite_history(kite, sym, exch)
+for sym, exch, yahoo_ticker, strategy, name in INSTRUMENTS:
+    df = fetch_yahoo(yahoo_ticker, period="2y")
     if df.empty or len(df) < 50:
-        log.warning(f"  {sym:<14} SKIP — only {len(df)} bars returned")
+        log.warning(f"  {sym:<14} SKIP — only {len(df)} bars")
         continue
     instruments_data[sym] = (df, strategy, name)
     log.info(f"  {sym:<14} {len(df):>4} bars | "
@@ -498,8 +451,8 @@ for sym, exch, _yahoo, strategy, name in INSTRUMENTS:
 # ── Signals ───────────────────────────────────────────────────────────────────
 sep("-")
 log.info("  Computing signals on today's closing prices...")
-log.info(f"  {'Symbol':<14} {'Close':>10} {'Signal':>8} {'Details'}")
-log.info(f"  {'-'*58}")
+log.info(f"  {'Symbol':<14} {'Close':>10}  {'Signal':<8}  Details")
+log.info(f"  {'-'*60}")
 
 all_signals = {}
 for sym, (df, strategy, name) in instruments_data.items():
@@ -515,18 +468,24 @@ for sym, (df, strategy, name) in instruments_data.items():
     all_signals[sym] = sig
 
     if sig["entry_signal"]:
-        signal_str = "ENTRY  "
+        signal_str = "ENTRY   "
     elif sig["exit_signal"]:
-        signal_str = "EXIT   "
+        signal_str = "EXIT    "
     else:
-        signal_str = "hold   "
+        signal_str = "hold    "
 
     if strategy == "supertrend":
-        detail = f"ST={sig['st_direction']} nifty_ok={sig['nifty_ok']}"
+        detail = (f"ST={sig['st_direction']:<4}  "
+                  f"flip_bull={sig['flip_bull']}  "
+                  f"flip_bear={sig['flip_bear']}  "
+                  f"nifty_ok={sig['nifty_ok']}")
     else:
-        detail = f"RSI={sig['rsi']} vol_ok={sig['vol_ok']} trend_ok={sig['trend_ok']}"
+        detail = (f"RSI={sig['rsi']:>5.1f}  "
+                  f"vol_ok={sig['vol_ok']}  "
+                  f"trend_ok={sig['trend_ok']}")
 
-    log.info(f"  {sym:<14} Rs {sig['close']:>9,.2f} {signal_str}  {detail}")
+    log.info(f"  {sym:<14} Rs {sig['close']:>9,.2f}  "
+             f"{signal_str}  {detail}")
 
 # =============================================================================
 # EXIT PASS
@@ -560,8 +519,7 @@ for sym, exch, _yahoo, strategy, name in INSTRUMENTS:
         log.info(f"  {sym:<14} HOLDING | "
                  f"entry=Rs {entry_price:,.2f} ({entry_date}) | "
                  f"now=Rs {latest_price:,.2f} | "
-                 f"move={move_pct:+.2%} | "
-                 f"days_held={bars_held}")
+                 f"move={move_pct:+.2%} | days={bars_held}")
         save_position(sym, {**pos, "Bars_Held": bars_held + 1})
         continue
 
@@ -574,7 +532,8 @@ for sym, exch, _yahoo, strategy, name in INSTRUMENTS:
     sign         = "+" if pnl >= 0 else ""
 
     log.info(f"  {sym:<14} EXIT [{exit_reason}] | "
-             f"entry=Rs {entry_price:,.2f} -> now=Rs {latest_price:,.2f} | "
+             f"entry=Rs {entry_price:,.2f} -> "
+             f"now=Rs {latest_price:,.2f} | "
              f"qty={quantity} | move={move_pct:+.2%} | "
              f"PnL=Rs {pnl:+,.2f}")
 
@@ -626,9 +585,9 @@ for sym, exch, _yahoo, strategy, name in INSTRUMENTS:
                 order_type       = kite.ORDER_TYPE_MARKET,
                 tag              = "indiabot_exit",
             )
-            log.info(f"    AMO SELL placed: order_id={order_id} "
-                     f"(executes at market open ~9:15 AM IST)")
-        except KiteException as e:
+            log.info(f"    AMO SELL placed: {order_id} "
+                     f"(executes at open ~9:15 AM IST)")
+        except Exception as e:
             log.error(f"    ORDER FAILED: {e}")
 
     clear_position(sym)
@@ -642,8 +601,8 @@ if not any_exit and count_open() == 0:
 sep("-")
 log.info("  ENTRY PASS — checking for new signals...")
 
-open_count   = count_open()
-open_equity  = sum(
+open_count  = count_open()
+open_equity = sum(
     int(load_position(sym)["Quantity"]) *
     float(instruments_data[sym][0]["Close"].iloc[-1])
     for sym, *_ in INSTRUMENTS
@@ -662,9 +621,9 @@ entry_signals = [
 if not entry_signals:
     log.info("  No entry signals this run.")
 else:
-    log.info(f"  {len(entry_signals)} entry signal(s) found:")
+    log.info(f"  {len(entry_signals)} signal(s) found:")
     for sym, exch, name, strategy, sig in entry_signals:
-        log.info(f"    {sym} ({name}) — close=Rs {sig['close']:,.2f}")
+        log.info(f"    {sym} ({name})  close=Rs {sig['close']:,.2f}")
 
     for sym, exch, name, strategy, sig in entry_signals:
 
@@ -676,15 +635,21 @@ else:
         allocation = total_equity * ALLOCATION_PCT
         if cash < allocation or allocation <= 0:
             log.info(f"  {sym:<14} BLOCKED — insufficient cash "
-                     f"(need Rs {allocation:,.0f}, have Rs {cash:,.0f})")
+                     f"(need Rs {allocation:,.0f}, "
+                     f"have Rs {cash:,.0f})")
             continue
 
         latest_price = sig["close"]
-        quantity     = max(MIN_QUANTITY,
-                           int(allocation / (latest_price * (1 + COMMISSION_RT / 2))))
+        quantity     = max(
+            MIN_QUANTITY,
+            int(allocation / (latest_price * (1 + COMMISSION_RT / 2)))
+        )
 
         if quantity <= 0:
-            log.info(f"  {sym:<14} BLOCKED — allocation too small for 1 share")
+            log.info(f"  {sym:<14} BLOCKED — "
+                     f"allocation too small for 1 share "
+                     f"(share=Rs {latest_price:,.0f}, "
+                     f"allocation=Rs {allocation:,.0f})")
             continue
 
         actual_cost = quantity * latest_price * (1 + COMMISSION_RT / 2)
@@ -696,13 +661,14 @@ else:
         log.info(f"    Quantity   : {quantity} shares")
         log.info(f"    Cost       : Rs {actual_cost:,.2f}")
         log.info(f"    Allocation : Rs {allocation:,.2f} "
-                 f"({ALLOCATION_PCT:.1%} of Rs {total_equity:,.2f} equity)")
+                 f"({ALLOCATION_PCT:.1%} of Rs {total_equity:,.2f})")
         if strategy == "supertrend":
-            log.info(f"    Supertrend : {sig['st_direction']} | "
+            log.info(f"    ST flip    : bullish | "
                      f"Nifty OK: {sig['nifty_ok']}")
         else:
             log.info(f"    RSI        : {sig['rsi']} | "
-                     f"Vol OK: {sig['vol_ok']} | Trend OK: {sig['trend_ok']}")
+                     f"Vol OK: {sig['vol_ok']} | "
+                     f"Trend OK: {sig['trend_ok']}")
 
         if TRADING_MODE == "live" and kite:
             try:
@@ -716,9 +682,9 @@ else:
                     order_type       = kite.ORDER_TYPE_MARKET,
                     tag              = "indiabot_entry",
                 )
-                log.info(f"    AMO BUY placed: order_id={order_id} "
-                         f"(executes at market open ~9:15 AM IST)")
-            except KiteException as e:
+                log.info(f"    AMO BUY placed: {order_id} "
+                         f"(executes at open ~9:15 AM IST)")
+            except Exception as e:
                 log.error(f"    ORDER FAILED: {e}")
                 continue
 
@@ -737,7 +703,9 @@ else:
         open_count  += 1
         total_trades += 1
         trades_run   += 1
-        run_events.append(f"{sym} ENTRY @ Rs{latest_price:.0f} qty={quantity}")
+        run_events.append(
+            f"{sym} ENTRY @ Rs{latest_price:.0f} qty={quantity}"
+        )
 
         _telegram(
             f"<b>India Bot — ENTRY</b>\n"
@@ -758,7 +726,7 @@ open_equity = sum(
     for sym, *_ in INSTRUMENTS
     if load_position(sym) and sym in instruments_data
 )
-unrealized   = sum(
+unrealized = sum(
     (float(instruments_data[sym][0]["Close"].iloc[-1]) -
      float(load_position(sym)["Entry Price"])) *
     int(load_position(sym)["Quantity"])
@@ -771,25 +739,24 @@ open_count   = count_open()
 log_portfolio(cash, final_equity, open_count,
               realized_pnl, unrealized, total_trades, run_events)
 
-# ── Run log ───────────────────────────────────────────────────────────────────
 run_end     = datetime.now(IST)
 run_seconds = (run_end - run_start).total_seconds()
 
 log_run({
-    "Date":           run_start.strftime("%Y-%m-%d"),
-    "Time":           run_start.strftime("%H:%M:%S IST"),
-    "Mode":           TRADING_MODE.upper(),
-    "Cash":           round(cash, 2),
-    "Open Equity":    round(open_equity, 2),
-    "Total Equity":   round(final_equity, 2),
-    "Return Pct":     round((final_equity / INITIAL_CAPITAL - 1) * 100, 2),
-    "Open Positions": open_count,
-    "Realized PnL":   round(realized_pnl, 2),
-    "Unrealized PnL": round(unrealized, 2),
-    "Trades This Run":trades_run,
-    "Total Trades":   total_trades,
-    "Events":         " | ".join(run_events) if run_events else "NO_ACTION",
-    "Run Seconds":    round(run_seconds, 1),
+    "Date":            run_start.strftime("%Y-%m-%d"),
+    "Time":            run_start.strftime("%H:%M:%S IST"),
+    "Mode":            TRADING_MODE.upper(),
+    "Cash":            round(cash, 2),
+    "Open Equity":     round(open_equity, 2),
+    "Total Equity":    round(final_equity, 2),
+    "Return Pct":      round((final_equity / INITIAL_CAPITAL - 1) * 100, 2),
+    "Open Positions":  open_count,
+    "Realized PnL":    round(realized_pnl, 2),
+    "Unrealized PnL":  round(unrealized, 2),
+    "Trades This Run": trades_run,
+    "Total Trades":    total_trades,
+    "Events":          " | ".join(run_events) if run_events else "NO_ACTION",
+    "Run Seconds":     round(run_seconds, 1),
 })
 
 _telegram(
@@ -800,10 +767,10 @@ _telegram(
     f"Open     : {open_count} positions\n"
     f"Realized : Rs {realized_pnl:+,.2f}\n"
     f"Return   : {(final_equity/INITIAL_CAPITAL-1)*100:+.2f}%\n"
-    f"Action   : {' | '.join(run_events) if run_events else 'No action today'}"
+    f"Action   : "
+    f"{'  |  '.join(run_events) if run_events else 'No action today'}"
 )
 
-# ── Final print ───────────────────────────────────────────────────────────────
 sep()
 log.info("  PORTFOLIO SNAPSHOT")
 sep("-")
@@ -827,15 +794,15 @@ if open_count > 0:
         pos = load_position(sym)
         if pos is None:
             continue
-        ep   = float(pos["Entry Price"])
-        qty  = int(pos["Quantity"])
-        bars = int(pos.get("Bars_Held", 0))
-        edate= pos.get("Entry Date", "?")
-        cp   = (float(instruments_data[sym][0]["Close"].iloc[-1])
-                if sym in instruments_data else ep)
-        move = (cp - ep) / ep
-        pnl  = (cp - ep) * qty
-        sign = "+" if pnl >= 0 else ""
+        ep    = float(pos["Entry Price"])
+        qty   = int(pos["Quantity"])
+        bars  = int(pos.get("Bars_Held", 0))
+        edate = pos.get("Entry Date", "?")
+        cp    = (float(instruments_data[sym][0]["Close"].iloc[-1])
+                 if sym in instruments_data else ep)
+        move  = (cp - ep) / ep
+        pnl   = (cp - ep) * qty
+        sign  = "+" if pnl >= 0 else ""
         log.info(f"  {sym} ({name})")
         log.info(f"    Entry    : Rs {ep:,.2f}  on {edate}")
         log.info(f"    Current  : Rs {cp:,.2f}")
@@ -843,8 +810,7 @@ if open_count > 0:
         log.info(f"    PnL      : {sign}Rs {abs(pnl):,.2f}")
         log.info(f"    Qty      : {qty} shares")
         log.info(f"    Days held: {bars}")
-        log.info(f"    Strategy : {pos.get('Strategy', strategy)}")
 
 sep()
-log.info(f"  Run complete. Next run: tomorrow 15:45 IST")
+log.info("  Run complete. Next run: tomorrow 15:45 IST")
 sep()

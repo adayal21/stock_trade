@@ -1,11 +1,9 @@
 # =============================================================================
 # India Bot — Requirements
-# =============================================================================
-# Install with:
-#   pip install -r requirements.txt
+# Install: pip install -r requirements.txt
 # =============================================================================
 
-# Zerodha Kite Connect official Python client
+# Zerodha Kite Connect (for order placement in live mode only)
 kiteconnect>=5.0.0
 
 # Environment variable management
@@ -17,6 +15,9 @@ numpy>=1.24.0
 
 # Technical indicators (Supertrend, RSI, EMA)
 pandas_ta>=0.3.14b
+
+# Market data — Yahoo Finance (free, used for daily candles)
+yfinance>=0.2.40
 
 # HTTP requests (Telegram notifications)
 requests>=2.31.0
